@@ -1,3 +1,5 @@
+#include <assert.h>
+#include <cmath>
 #include <iostream>
 #include <vector>
 #include <string>
@@ -9,6 +11,47 @@
 #else
 	#include "CL/cl.h"
 #endif
+
+typedef float kernel_elem;
+typedef std::vector<kernel_elem> kernel_row;
+typedef std::vector<kernel_row> kernel_type;
+
+kernel_elem gaussian (double x, double mu, double sigma)
+{
+	const double a = (x - mu) / sigma;
+	return std::exp(-0.5 * a * a);
+}
+
+kernel_type produce2dGaussianKernel (unsigned int kernelRadius) {
+
+	// Singularity if radius is zero. Just return back a 1x1 matrix with full weight
+	// assigned to the single pixel.
+	if (kernelRadius == 0) {
+		return { { 1 } };
+	}
+
+	double sigma = kernelRadius / 2.;
+	kernel_type kernel2d(2 * kernelRadius + 1, kernel_row(2 * kernelRadius + 1));
+	double sum = 0;
+
+	// compute values
+	for (int row = 0; row < kernel2d.size(); row++) {
+		for (int col = 0; col < kernel2d[row].size(); col++) {
+			double x = gaussian(row, kernelRadius, sigma) * gaussian(col, kernelRadius, sigma);
+			kernel2d[row][col] = x;
+			sum += x;
+		}
+	}
+
+	// normalize
+	for (int row = 0; row < kernel2d.size(); row++) {
+		for (int col = 0; col < kernel2d[row].size(); col++) {
+			kernel2d[row][col] /= sum;
+		}
+	}
+
+	return kernel2d;
+}
 
 struct Image
 {
@@ -160,8 +203,15 @@ cl_program CreateProgram (const std::string& source,
 	return program;
 }
 
-int main ()
+int main (int argc, char* argv[])
 {
+	if (argc != 2) {
+		printf("Usage: %s <filter size>\n", argv[0]);
+		exit(1);
+	}
+
+	int filterSize = atoi(argv[1]);
+
 	// http://www.khronos.org/registry/cl/sdk/1.1/docs/man/xhtml/clGetPlatformIDs.html
 	cl_uint platformIdCount = 0;
 	clGetPlatformIDs (0, nullptr, &platformIdCount);
@@ -215,23 +265,27 @@ int main ()
 	std::cout << "Context created" << std::endl;
 
 	// Simple Gaussian blur filter
-	float filter [] = {
-		1, 2, 1,
-		2, 4, 2,
-		1, 2, 1
-	};
+	float filter [2 * filterSize + 1][2 * filterSize + 1];
 
-	// Normalize the filter
-	for (int i = 0; i < 9; ++i) {
-		filter [i] /= 16.0f;
+	kernel_type k = produce2dGaussianKernel(filterSize);
+
+	assert((sizeof(filter) / sizeof(float)) == k[0].size() * k.size());
+
+	for (int i = 0; i < k.size(); i++) {
+		for (int j = 0; j < k[0].size(); j++) {
+			filter[i][j] = k[i][j];
+		}
 	}
 
 	// Create a program from source
 	cl_program program = CreateProgram (LoadKernel ("kernels/image.cl"),
 		context);
 
+	char programOptions[256];
+	snprintf(programOptions, sizeof(programOptions), "-D RADIUS=%d", filterSize);
+
 	CheckError (clBuildProgram (program, deviceIdCount, deviceIds.data (), 
-		"-D FILTER_SIZE=1", nullptr, nullptr));
+		programOptions, nullptr, nullptr));
 
 	// http://www.khronos.org/registry/cl/sdk/1.1/docs/man/xhtml/clCreateKernel.html
 	cl_kernel kernel = clCreateKernel (program, "Filter", &error);
@@ -257,7 +311,7 @@ int main ()
 	// Create a buffer for the filter weights
 	// http://www.khronos.org/registry/cl/sdk/1.1/docs/man/xhtml/clCreateBuffer.html
 	cl_mem filterWeightsBuffer = clCreateBuffer (context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-		sizeof (float) * 9, filter, &error);
+		sizeof (filter), filter, &error);
 	CheckError (error);
 
 	// Setup the kernel arguments
@@ -273,7 +327,7 @@ int main ()
 	// Run the processing
 	// http://www.khronos.org/registry/cl/sdk/1.1/docs/man/xhtml/clEnqueueNDRangeKernel.html
 	std::size_t offset [3] = { 0 };
-	std::size_t size [3] = { image.width, image.height, 1 };
+	std::size_t size [3] = { static_cast<std::size_t>(image.width), static_cast<std::size_t>(image.height), 1 };
 	CheckError (clEnqueueNDRangeKernel (queue, kernel, 2, offset, size, nullptr,
 		0, nullptr, nullptr));
 	
@@ -283,7 +337,7 @@ int main ()
 
 	// Get the result back to the host
 	std::size_t origin [3] = { 0 };
-	std::size_t region [3] = { result.width, result.height, 1 };
+	std::size_t region [3] = { static_cast<std::size_t>(result.width), static_cast<std::size_t>(result.height), 1 };
 	clEnqueueReadImage (queue, outputImage, CL_TRUE,
 		origin, region, 0, 0,
 		result.pixel.data (), 0, nullptr, nullptr);
